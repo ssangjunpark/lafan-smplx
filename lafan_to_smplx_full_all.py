@@ -1,0 +1,402 @@
+import argparse
+import os
+import glob
+
+import numpy as np
+import smplx
+import torch
+from scipy.spatial.transform import Rotation as R
+from smplx.joint_names import JOINT_NAMES
+
+from general_motion_retargeting.utils.lafan_vendor.extract import read_bvh
+# from general_motion_retargeting.utils.lafan1 import (
+    # load_lafan1_file as _load_lafan1_file,
+# )
+from general_motion_retargeting.utils.lafan1 import load_bvh_file as _load_lafan1_file
+
+LAFAN1_FRAME_RATE = 30.0
+
+def load_lafan1_file(file_path):
+    return _load_lafan1_file(file_path)[0]
+
+
+def get_smplx_local_joint(
+    lafan_frame_name, lafan_frame_quat, lafan_parent_frame_name, lafan_parent_frame_quat
+):
+    parent_frame_global_rot = (
+        R.from_quat(lafan_parent_frame_quat, scalar_first=True)
+        * lafan_frame_offsets[lafan_parent_frame_name]
+    )
+    frame_global_quat = (
+        R.from_quat(lafan_frame_quat, scalar_first=True)
+        * lafan_frame_offsets[lafan_frame_name]
+    )
+    frame_local_quat = parent_frame_global_rot.inv() * frame_global_quat
+    return frame_local_quat.as_rotvec()
+
+
+lafan_frame_offsets = {
+    "world": R.from_euler("x", 0),
+    "Hips": R.from_euler("z", -np.pi / 2) * R.from_euler("y", -np.pi / 2),
+    "LeftUpLeg": R.from_euler("z", np.pi / 2) * R.from_euler("y", np.pi / 2),
+    "LeftLeg": R.from_euler("z", np.pi / 2) * R.from_euler("y", np.pi / 2),
+    "LeftFoot": R.from_euler("z", 0.37117860986509) * R.from_euler("y", np.pi / 2),
+    "LeftToe": R.from_euler("y", np.pi / 2),
+    "RightUpLeg": R.from_euler("z", np.pi / 2) * R.from_euler("y", np.pi / 2),
+    "RightLeg": R.from_euler("z", np.pi / 2) * R.from_euler("y", np.pi / 2),
+    "RightFoot": R.from_euler("z", 0.37117860986509) * R.from_euler("y", np.pi / 2),
+    "RightToe": R.from_euler("y", np.pi / 2),
+    "Spine": R.from_euler("z", -np.pi / 2) * R.from_euler("y", -np.pi / 2),
+    "Spine1": R.from_euler("z", -np.pi / 2) * R.from_euler("y", -np.pi / 2),
+    "Spine2": R.from_euler("z", -np.pi / 2) * R.from_euler("y", -np.pi / 2),
+    "Neck": R.from_euler("z", -np.pi / 2) * R.from_euler("y", -np.pi / 2),
+    "Head": R.from_euler("z", -np.pi / 2) * R.from_euler("y", -np.pi / 2),
+    "LeftShoulder": R.from_euler("x", np.pi / 2),
+    "LeftArm": R.from_euler("x", np.pi / 2),
+    "LeftForeArm": R.from_euler("x", np.pi / 2),
+    "LeftHand": R.from_euler("x", np.pi / 2),
+    "RightShoulder": R.from_euler("z", np.pi) * R.from_euler("x", -np.pi / 2),
+    "RightArm": R.from_euler("z", np.pi) * R.from_euler("x", -np.pi / 2),
+    "RightForeArm": R.from_euler("z", np.pi) * R.from_euler("x", -np.pi / 2),
+    "RightHand": R.from_euler("z", np.pi) * R.from_euler("x", -np.pi / 2),
+}
+
+smplx_to_lafan_map = {
+    "left_hip": "LeftUpLeg",
+    "right_hip": "RightUpLeg",
+    "spine1": "Spine",
+    "left_knee": "LeftLeg",
+    "right_knee": "RightLeg",
+    "spine2": "Spine1",
+    "left_ankle": "LeftFoot",
+    "right_ankle": "RightFoot",
+    "spine3": "Spine2",
+    "left_foot": "LeftToe",
+    "right_foot": "RightToe",
+    "neck": "Neck",
+    "left_collar": "LeftShoulder",
+    "right_collar": "RightShoulder",
+    "head": "Head",
+    "left_shoulder": "LeftArm",
+    "right_shoulder": "RightArm",
+    "left_elbow": "LeftForeArm",
+    "right_elbow": "RightForeArm",
+    "left_wrist": "LeftHand",
+    "right_wrist": "RightHand",
+}
+
+
+betas = {
+    "smpl": torch.tensor(
+        [
+            [
+                0.9597,
+                1.0887,
+                -2.1717,
+                -0.8611,
+                1.3940,
+                0.1401,
+                -0.2469,
+                0.3182,
+                -0.2482,
+                0.3085,
+            ]
+        ],
+        dtype=torch.float32,
+    ),
+    "smplx": torch.tensor(
+        [
+            [
+                1.4775,
+                0.6674,
+                -1.1742,
+                0.4731,
+                1.2984,
+                -0.2159,
+                1.5276,
+                -0.3152,
+                -0.6441,
+                -0.2986,
+                0.5089,
+                -0.6354,
+                0.3321,
+                -0.1099,
+                -0.3060,
+                -0.7330,
+            ]
+        ],
+        dtype=torch.float32,
+    ),
+}
+
+def process_single_bvh(bvh_file, output_file, smplx_model_path, model_type, rerun=False):
+    try:
+        data = read_bvh(bvh_file)
+        frames = load_lafan1_file(bvh_file)
+    except Exception as e:
+        print(f"  Skipping {bvh_file} - failed to load: {e}")
+        return False
+
+    n_frames = len(frames)
+
+    device = "cpu"
+    body_model = smplx.create(
+        model_path=smplx_model_path,
+        model_type=model_type,
+        use_pca=False,
+        betas=betas[model_type].to(device),
+    )
+
+    trans_tensor = torch.zeros((n_frames, 3), device=device, dtype=torch.float32)
+    root_orient_tensor = torch.zeros((n_frames, 3), device=device, dtype=torch.float32)
+    body_pose_tensor = torch.zeros(
+        (n_frames, body_model.NUM_BODY_JOINTS, 3), device=device, dtype=torch.float32
+    )
+    lafan_centroids = []
+    
+    for frame in range(n_frames):
+        root_orient = (
+            R.from_quat(frames[frame]["Hips"][1], scalar_first=True)
+            * lafan_frame_offsets["Hips"]
+        )
+
+        body_pose = torch.zeros(
+            (body_model.NUM_BODY_JOINTS, 3), device=device, dtype=torch.float32
+        )
+        for i, joint_name in enumerate(
+            JOINT_NAMES[1:22]
+        ):
+            if joint_name not in smplx_to_lafan_map:
+                continue
+            lafan_joint_name = smplx_to_lafan_map[joint_name]
+            parent_name = data.bones[data.parents[data.bones.index(lafan_joint_name)]]
+            body_pose[i] = torch.from_numpy(
+                get_smplx_local_joint(
+                    lafan_joint_name,
+                    frames[frame][lafan_joint_name][1],
+                    parent_name,
+                    frames[frame][parent_name][1],
+                )
+            )
+
+        lafan_positions = torch.from_numpy(
+            np.array(
+                [frames[frame][name][0] for name in frames[frame] if "Mod" not in name],
+                dtype=np.float32,
+            )
+        ).to(device)
+        lafan_centroids.append(lafan_positions.mean(dim=0))
+        
+        root_orient_tensor[frame] = torch.tensor(
+            root_orient.as_rotvec(), device=device
+        ).float()
+        body_pose_tensor[frame] = body_pose.clone()
+
+    lafan_centroids = torch.stack(lafan_centroids)
+
+    with torch.no_grad():
+        smplx_kwargs = {
+            "betas": betas[model_type].to(device).view(1, -1).expand(n_frames, -1),
+            "global_orient": root_orient_tensor,
+            "body_pose": body_pose_tensor.flatten(1),
+            "return_full_pose": True,
+        }
+        if model_type == "smplx":
+            smplx_kwargs.update({
+                "jaw_pose": torch.zeros(n_frames, 3, device=device, dtype=torch.float32),
+                "leye_pose": torch.zeros(n_frames, 3, device=device, dtype=torch.float32),
+                "reye_pose": torch.zeros(n_frames, 3, device=device, dtype=torch.float32),
+                "left_hand_pose": torch.zeros(n_frames, 45, device=device, dtype=torch.float32),
+                "right_hand_pose": torch.zeros(n_frames, 45, device=device, dtype=torch.float32),
+                "expression": torch.zeros(n_frames, 10, device=device, dtype=torch.float32),
+            })
+        smplx_output = body_model(**smplx_kwargs)
+
+    smplx_centroids = smplx_output.joints[:, :22].mean(dim=1)
+    trans_tensor = lafan_centroids - smplx_centroids
+
+    smplx_data = {
+        "betas": body_model.betas.detach().cpu().squeeze().numpy(),
+        "root_orient": root_orient_tensor.cpu().numpy(),
+        "pose_body": body_pose_tensor.flatten(1).cpu().numpy(),
+        "trans": trans_tensor.cpu().numpy(),
+    }
+
+    num_frames = smplx_data["pose_body"].shape[0]
+    smplx_output = body_model(
+        betas=torch.tensor(smplx_data["betas"]).float().view(1, -1).expand(num_frames, -1),
+        global_orient=torch.tensor(smplx_data["root_orient"]).float(), # (N, 3)
+        body_pose=torch.tensor(smplx_data["pose_body"]).float(), # (N, 63)
+        transl=torch.tensor(smplx_data["trans"]).float(), # (N, 3)
+        left_hand_pose=torch.zeros(num_frames, 45).float(),
+        right_hand_pose=torch.zeros(num_frames, 45).float(),
+        jaw_pose=torch.zeros(num_frames, 3).float(),
+        leye_pose=torch.zeros(num_frames, 3).float(),
+        reye_pose=torch.zeros(num_frames, 3).float(),
+        expression=torch.zeros(num_frames, 10).float(),
+        return_full_pose=True,
+    )
+
+    if rerun:
+        import rerun as rr
+        for frame in range(n_frames):
+            rr.set_time_sequence("frame", frame)
+            rr.log(
+                "nameless_motion",
+                rr.Mesh3D(
+                    vertex_positions=smplx_output.vertices[frame]
+                    .detach()
+                    .cpu()
+                    .numpy(),
+                    triangle_indices=body_model.faces,
+                ),
+            )
+
+    if output_file is not None:
+        full_poses_tensor = torch.cat(
+            [root_orient_tensor.unsqueeze(1), body_pose_tensor],
+            dim=1,
+        )
+        
+        jaw_pose_tensor = torch.zeros((n_frames, 3), device=device, dtype=torch.float32)
+        leye_pose_tensor = torch.zeros((n_frames, 3), device=device, dtype=torch.float32)
+        reye_pose_tensor = torch.zeros((n_frames, 3), device=device, dtype=torch.float32)
+        left_hand_pose_tensor = torch.zeros((n_frames, 45), device=device, dtype=torch.float32)
+        right_hand_pose_tensor = torch.zeros((n_frames, 45), device=device, dtype=torch.float32)
+        
+        if model_type == "smplx":
+
+            jaw_pose_reshaped = jaw_pose_tensor.unsqueeze(1)  # (N, 1, 3)
+            leye_pose_reshaped = leye_pose_tensor.unsqueeze(1)  # (N, 1, 3)
+            reye_pose_reshaped = reye_pose_tensor.unsqueeze(1)  # (N, 1, 3)
+            
+            left_hand_reshaped = left_hand_pose_tensor.view(n_frames, 15, 3)  # (N, 15, 3)
+            right_hand_reshaped = right_hand_pose_tensor.view(n_frames, 15, 3)  # (N, 15, 3)
+            
+            full_poses_tensor = torch.cat([
+                full_poses_tensor,  # (N, 22, 3) - root + body
+                jaw_pose_reshaped,  # (N, 1, 3)
+                leye_pose_reshaped,  # (N, 1, 3)
+                reye_pose_reshaped,  # (N, 1, 3)
+                left_hand_reshaped,  # (N, 15, 3)
+                right_hand_reshaped,  # (N, 15, 3)
+            ], dim=1)
+        
+        pose_eye_tensor = torch.cat([leye_pose_tensor, reye_pose_tensor], dim=-1)  # (N, 6)
+        
+        pose_hand_tensor = torch.cat([left_hand_pose_tensor, right_hand_pose_tensor], dim=-1)  # (N, 90)
+        
+        mocap_time_length = n_frames / LAFAN1_FRAME_RATE
+        
+        betas_array = body_model.betas.detach().cpu().squeeze().numpy()
+        num_betas = len(betas_array)
+        
+        poses_flat = full_poses_tensor.flatten(1).cpu().numpy()
+        
+
+        markers_latent = np.zeros((n_frames, 0), dtype=np.float32)
+        latent_labels = np.array([], dtype=str)
+        markers_latent_vids = np.array([], dtype=np.int64)
+
+        np.savez(
+            output_file,
+            gender="neutral",
+            surface_model_type=model_type,
+            mocap_frame_rate=LAFAN1_FRAME_RATE,
+            mocap_time_length=mocap_time_length,
+            
+            markers_latent=markers_latent,
+            latent_labels=latent_labels,
+            markers_latent_vids=markers_latent_vids,
+            
+            trans=trans_tensor.cpu().numpy(),
+            
+            poses=poses_flat,
+            
+            betas=betas_array,
+            num_betas=num_betas,
+            
+            root_orient=root_orient_tensor.cpu().numpy(),
+            pose_body=body_pose_tensor.flatten(1).cpu().numpy(),
+            pose_hand=pose_hand_tensor.cpu().numpy(),
+            pose_jaw=jaw_pose_tensor.cpu().numpy(),
+            pose_eye=pose_eye_tensor.cpu().numpy(),
+        )
+    
+    return True
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert all LAFAN1 BVH files in a folder to SMPL-X NPZ format with full parameters"
+    )
+    parser.add_argument(
+        "--bvh_folder", 
+        type=str, 
+        required=True, 
+        help="Folder containing .bvh files"
+    )
+    parser.add_argument(
+        "--smplx_model_path", 
+        type=str, 
+        required=True,
+        help="Path to the SMPL-X model folder"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        default="smplx",
+        choices=["smpl", "smplx"],
+        help="Body model type (default: smplx)"
+    )
+    parser.add_argument(
+        "--output_folder", 
+        type=str, 
+        required=True, 
+        help="Folder to save output .npz files"
+    )
+    parser.add_argument(
+        "--rerun",
+        action="store_true",
+        help="Whether to visualize the result in Rerun",
+    )
+    args = parser.parse_args()
+
+    if args.rerun:
+        import rerun as rr
+        rr.init("lafan_to_smplx_full_all", spawn=True)
+
+    if not os.path.exists(args.output_folder):
+        os.makedirs(args.output_folder)
+        print(f"Created output folder: {args.output_folder}")
+
+    bvh_files = glob.glob(os.path.join(args.bvh_folder, "*.bvh"))
+    print(f"Found {len(bvh_files)} BVH files in {args.bvh_folder}")
+
+    success_count = 0
+    fail_count = 0
+    
+    for i, bvh_file in enumerate(bvh_files):
+        filename = os.path.basename(bvh_file)
+        name, ext = os.path.splitext(filename)
+        output_file = os.path.join(args.output_folder, name + ".npz")
+        
+        print(f"[{i+1}/{len(bvh_files)}] Processing {filename}...")
+        try:
+            success = process_single_bvh(
+                bvh_file, 
+                output_file, 
+                args.smplx_model_path, 
+                args.model_type, 
+                args.rerun
+            )
+            if success:
+                success_count += 1
+            else:
+                fail_count += 1
+        except Exception as e:
+            print(f"  Error processing {filename}: {e}")
+            fail_count += 1
+
+    print(f"\nDone! Processed {success_count} files successfully, {fail_count} failed.")
+    print(f"Output saved to: {args.output_folder}")
