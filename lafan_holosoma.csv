@@ -1,5 +1,5 @@
 file_path,task_name,augmentation,num_frames,time,fps
-demo_data/lafan/dance1_subject1.npy,dance1_subject1,original,3945,0.0,0.0
+demo_data/lafan/dance1_subject1.npy,dance1_subject1,original,3945,1275.933116197586,3.0918548550228966
 demo_data/lafan/dance1_subject2.npy,dance1_subject2,original,3945,1537.6209919452667,2.565651757270251
 demo_data/lafan/dance1_subject3.npy,dance1_subject3,original,3945,1672.3372032642365,2.358974010923007
 demo_data/lafan/aiming1_subject1.npy,aiming1_subject1,original,7184,1966.8255460262299,3.65258627767701
